@@ -20,7 +20,7 @@ services:
       - traefik.http.routers.traefik.service=api@internal
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.1.0@sha256:565ee87b06ce92e26eee43e4e0ba4cba4d6b76c9d7a1dee64de1cf3b9deb1e76
     container_name: es-local-prometheus
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -37,7 +37,7 @@ services:
       - traefik.http.services.prometheus.loadbalancer.server.port=9090
 
   kibana_settings:
-    image: curlimages/curl:latest
+    image: curlimages/curl:8.11.1@sha256:73e4d532ea62d7505c5865b517d3704966ffe916609bedc22af6833dc9969bd9
     container_name: kibana-settings
     restart: "no"
     command:
@@ -81,7 +81,7 @@ services:
       - traefik.http.services.kibana.loadbalancer.server.port=5601
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.4.0@sha256:6132a7c2b3b41f4f5e04fa5a8c2f60efe3d4ea0a2a7e3a57d2e0fb7e4a8c8e2b
     container_name: es-local-grafana
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
@@ -104,7 +104,7 @@ services:
       - traefik.http.services.grafana.loadbalancer.server.port=3000
 
   grafana_dashboard_init:
-    image: alpine:latest
+    image: alpine:3.21.0@sha256:21dc6063fd678b478f57c0e13f47560d0ea4eeba26dfc947b2a4f81f686b9f45
     container_name: grafana-dashboard-init
     restart: "no"
     depends_on:

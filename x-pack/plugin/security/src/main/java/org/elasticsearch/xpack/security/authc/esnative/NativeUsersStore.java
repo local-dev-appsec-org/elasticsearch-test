@@ -53,13 +53,17 @@ import org.elasticsearch.xpack.core.security.user.User.Fields;
 import org.elasticsearch.xpack.security.support.SecurityIndexManager;
 import org.elasticsearch.xpack.security.support.SecurityIndexManager.IndexState;
 
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -85,15 +89,47 @@ public class NativeUsersStore {
     public static final String USER_NOT_FOUND_MESSAGE = "user must exist in order to change password";
     private static final Logger logger = LogManager.getLogger(NativeUsersStore.class);
 
+    // Per-username sliding-window lockout to mitigate online password guessing /
+    // credential-stuffing against the native realm (see verifyPassword).
+    private static final int MAX_FAILED_ATTEMPTS = 10;
+    private static final long FAILURE_WINDOW_MILLIS = TimeUnit.MINUTES.toMillis(5);
+
     private final Settings settings;
     private final Client client;
 
     private final SecurityIndexManager securityIndex;
+    private final ConcurrentHashMap<String, FailedAttemptTracker> failedAttempts = new ConcurrentHashMap<>();
 
     public NativeUsersStore(Settings settings, Client client, SecurityIndexManager securityIndex) {
         this.settings = settings;
         this.client = client;
         this.securityIndex = securityIndex;
+    }
+
+    /**
+     * Tracks recent failed-authentication timestamps for a single principal, applying a
+     * sliding window so that lockout decisions reflect only attempts in the recent past.
+     */
+    private static final class FailedAttemptTracker {
+        private final Deque<Long> timestamps = new ArrayDeque<>();
+
+        synchronized int recordFailure(long now) {
+            purgeOlderThan(now - FAILURE_WINDOW_MILLIS);
+            timestamps.addLast(now);
+            return timestamps.size();
+        }
+
+        synchronized int recentCount(long now) {
+            purgeOlderThan(now - FAILURE_WINDOW_MILLIS);
+            return timestamps.size();
+        }
+
+        private void purgeOlderThan(long cutoff) {
+            Long head;
+            while ((head = timestamps.peekFirst()) != null && head < cutoff) {
+                timestamps.pollFirst();
+            }
+        }
     }
 
     /**
@@ -607,10 +643,32 @@ public class NativeUsersStore {
     /**
      * This method is used to verify the username and credentials against those stored in the system.
      *
+     * <p>Repeated failed attempts for the same principal within {@link #FAILURE_WINDOW_MILLIS} are
+     * counted; once the count reaches {@link #MAX_FAILED_ATTEMPTS} subsequent attempts are rejected
+     * without consulting the password hash. This guards the native realm against online password
+     * guessing and credential-stuffing attacks (CWE-307).
+     *
      * @param username username to lookup the user by
      * @param password the plaintext password to verify
      */
     void verifyPassword(String username, final SecureString password, ActionListener<AuthenticationResult<User>> listener) {
+        final long now = System.currentTimeMillis();
+        final FailedAttemptTracker existingTracker = failedAttempts.get(username);
+        if (existingTracker != null && existingTracker.recentCount(now) >= MAX_FAILED_ATTEMPTS) {
+            logger.warn(
+                "rejecting native realm authentication for user [{}]: too many recent failed attempts (>= {} within {} ms)",
+                username,
+                MAX_FAILED_ATTEMPTS,
+                FAILURE_WINDOW_MILLIS
+            );
+            listener.onResponse(
+                AuthenticationResult.unsuccessful(
+                    "Password authentication failed for " + username + ": too many recent failed attempts",
+                    null
+                )
+            );
+            return;
+        }
         getUserAndPassword(username, ActionListener.wrap((userAndPassword) -> {
             if (userAndPassword == null) {
                 logger.trace(
@@ -624,10 +682,18 @@ public class NativeUsersStore {
                 listener.onResponse(AuthenticationResult.notHandled());
             } else {
                 if (userAndPassword.verifyPassword(password)) {
+                    failedAttempts.remove(username);
                     logger.trace("successfully authenticated user [{}] (security index [{}])", userAndPassword, securityIndex.aliasName());
                     listener.onResponse(AuthenticationResult.success(userAndPassword.user()));
                 } else {
-                    logger.trace("password mismatch for user [{}] (security index [{}])", userAndPassword, securityIndex.aliasName());
+                    final int recentFailures = failedAttempts.computeIfAbsent(username, k -> new FailedAttemptTracker())
+                        .recordFailure(System.currentTimeMillis());
+                    logger.trace(
+                        "password mismatch for user [{}] (security index [{}], recent failures [{}])",
+                        userAndPassword,
+                        securityIndex.aliasName(),
+                        recentFailures
+                    );
                     listener.onResponse(AuthenticationResult.unsuccessful("Password authentication failed for " + username, null));
                 }
             }
